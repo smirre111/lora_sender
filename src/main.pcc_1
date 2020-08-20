@@ -1,0 +1,314 @@
+/*
+  LoRa Duplex communication wth callback
+
+  Sends a message every half second, and uses callback
+  for new incoming messages. Implements a one-byte addressing scheme,
+  with 0xFF as the broadcast address.
+
+  Note: while sending, LoRa radio is not listening for incoming messages.
+  Note2: when using the callback method, you can't use any of the Stream
+  functions that rely on the timeout, such as readString, parseInt(), etc.
+
+  created 28 April 2017
+  by Tom Igoe
+*/
+#include <SPI.h> // include libraries
+#include <LoRa.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <ArduinoJson.h>
+#include <queue>
+
+#define SS 18
+#define RST 14
+#define DI0 26
+#define BAND 433E6 //915E6
+
+#ifdef ARDUINO_SAMD_MKRWAN1300
+#error "This example is not compatible with the Arduino MKR WAN 1300 board!"
+#endif
+
+
+
+std::queue<uint8_t> commandQueue;
+
+struct Config
+{
+  char hostname[64];
+  uint8_t address;
+  uint8_t subnet;
+};
+
+const char *filename = "/config.txt"; // <- SD library uses 8.3 filenames
+Config config;                        // <- global configuration object
+
+const int csPin = SS;     // LoRa radio chip select
+const int resetPin = RST; // LoRa radio reset
+const int irqPin = DI0;   // change for your board; must be a hardware interrupt pin
+
+const byte broadcastAddressing = 0xFF;
+const byte subnetAddressing = 0xFE;
+String outgoing;          // outgoing message
+byte msgCount = 0;        // count of outgoing messages
+byte myAddress = 0xBB;    // address of this device
+byte mySubnet = 0xBB;     // address of this device
+byte destAddress = 0xFF;  // destination to send to
+byte destSubnet = 0x00;   // destination to send to
+long lastSendTime = 0;    // last send time
+int interval = 2000;      // interval between sends
+
+void loadConfiguration(const char *filename, Config &config)
+{
+  // Open file for reading
+  File file = SPIFFS.open(filename);
+
+  // Allocate a temporary JsonDocument
+  // Don't forget to change the capacity to match your requirements.
+  // Use arduinojson.org/v6/assistant to compute the capacity.
+  StaticJsonDocument<512> doc;
+
+  // Deserialize the JSON document
+  DeserializationError error = deserializeJson(doc, file);
+  if (error)
+    Serial.println(F("Failed to read file, using default configuration"));
+
+  // Copy values from the JsonDocument to the Config
+  config.address = doc["address"] | 0x00;
+  config.subnet = doc["subnet"] | 0x00;
+  strlcpy(config.hostname,                 // <- destination
+          doc["hostname"] | "example.com", // <- source
+          sizeof(config.hostname));        // <- destination's capacity
+
+  // Close the file (Curiously, File's destructor doesn't close the file)
+  file.close();
+}
+
+void saveConfiguration(const char *filename, const Config &config)
+{
+  // Delete existing file, otherwise the configuration is appended to the file
+  SPIFFS.remove(filename);
+
+  // Open file for writing
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println(F("Failed to create file"));
+    return;
+  }
+
+  // Allocate a temporary JsonDocument
+  // Don't forget to change the capacity to match your requirements.
+  // Use arduinojson.org/assistant to compute the capacity.
+  StaticJsonDocument<256> doc;
+
+  // Set the values in the document
+  doc["hostname"] = config.hostname;
+  doc["address"] = config.address;
+  doc["subnet"] = config.subnet;
+
+  // Serialize JSON to file
+  if (serializeJson(doc, file) == 0)
+  {
+    Serial.println(F("Failed to write to file"));
+  }
+
+  // Close the file
+  file.close();
+}
+
+
+const uint8_t CMD_UP = 1;
+const uint8_t CMD_DOWN = 2;
+const uint8_t CMD_ENABLE_WIFI = 3;
+const uint8_t CMD_DISABLE_WIFI = 4;
+const uint8_t CMD_OTA = 5;
+const uint8_t CMD_STATUS = 6;
+
+//B0 ... destination address
+//B1 ... senderAddress address
+//B2 ... message ID
+//B3 ... payload length
+//B4..N ... payload
+
+//P0 ... command
+//  01 ... up
+//  02 ... down
+//  03 ... enable wifi
+//  04 ... disable wifi
+//  05 ... ota
+//  06 ... status
+
+//P1 ... status field
+//  01 ... battery voltage
+//  02 ...
+
+
+void sendMessage(String outgoing)
+{
+  LoRa.beginPacket();            // start packet
+  LoRa.write(destAddress);       // add destination address
+  LoRa.write(destSubnet);      // add senderAddress address
+  LoRa.write(myAddress);      // add senderAddress address
+  LoRa.write(msgCount);          // add message ID
+  LoRa.write(outgoing.length()); // add payload length
+  LoRa.print(outgoing);          // add payload
+  LoRa.endPacket();              // finish packet and send it
+  msgCount++;                    // increment message ID
+}
+
+void onReceive(int packetSize)
+{
+  if (packetSize == 0)
+    return; // if there's no packet, return
+
+  // read packet header bytes:
+  int rxAddress = LoRa.read();       // rxAddress address
+  int rxSubnet = LoRa.read();        // rxSubnet address
+  byte senderAddress = LoRa.read();         // senderAddress address
+  byte incomingMsgId = LoRa.read();  // incoming msg ID
+  byte incomingLength = LoRa.read(); // incoming msg length
+
+  String incoming = ""; // payload of packet
+
+  while (LoRa.available())
+  {                                // can't use readString() in callback, so
+    incoming += (char)LoRa.read(); // add bytes one by one
+  }
+
+  if (incomingLength != incoming.length())
+  { // check length for error
+    Serial.println("error: message length does not match length");
+    return; // skip rest of function
+  }
+
+  // if the rxAddress isn't this device or broadcast,
+  if ((rxAddress != myAddress) && (rxAddress != broadcastAddressing))
+  {
+    Serial.println("This message is not for me.");
+    return; // skip rest of function
+  } 
+
+  if ((rxSubnet != mySubnet) && (rxAddress != subnetAddressing))
+  {
+    Serial.println("This message is not for me.");
+    return; // skip rest of function
+  } 
+
+
+  // if message is for this device, or broadcast, print details:
+  Serial.println("Received from: 0x" + String(senderAddress, HEX));
+  Serial.println("Sent to: 0x" + String(rxAddress, HEX));
+  Serial.println("Message ID: " + String(incomingMsgId));
+  Serial.println("Message length: " + String(incomingLength));
+  Serial.println("Message: " + incoming);
+  Serial.println("RSSI: " + String(LoRa.packetRssi()));
+  Serial.println("Snr: " + String(LoRa.packetSnr()));
+  Serial.println();
+
+  const char *payload = incoming.c_str();
+
+  commandQueue.push(payload[0]);
+
+}
+
+
+void publish() {
+
+
+}
+
+
+const uint8_t CMD_UP = 1;
+const uint8_t CMD_DOWN = 2;
+const uint8_t CMD_ENABLE_WIFI = 3;
+const uint8_t CMD_DISABLE_WIFI = 4;
+const uint8_t CMD_OTA = 5;
+const uint8_t CMD_STATUS = 6;
+
+void processCommand() {
+
+  if (!commandQueue.empty()) {
+    uint8_t cmd = commandQueue.front();
+    commandQueue.pop();
+
+    switch (cmd)
+    {
+    case CMD_UP:
+      Serial.println("Blinds up!");
+      break;
+    case CMD_DOWN:
+      Serial.println("Blinds down!");
+      break;
+    case CMD_ENABLE_WIFI:
+      Serial.println("Wifi on!");
+      break;
+    case CMD_DISABLE_WIFI:
+      Serial.println("Wifi off!");
+      break;
+    case CMD_OTA:
+      Serial.println("Ota enabled!");
+      break;
+    case CMD_STATUS:
+      Serial.println("Status!");
+      break;
+    default:
+      Serial.println("Not a valid command!");
+    }
+  }
+
+
+}
+
+void setup()
+{
+  Serial.begin(115200); // initialize serial
+  while (!Serial)
+    ;
+
+  Serial.println("LoRa Duplex with callback");
+
+  if (!SPIFFS.begin())
+  {
+    Serial.println("Cannot access SPIFFS");
+    return;
+  }
+
+  Serial.println(F("Loading configuration..."));
+  loadConfiguration(filename, config);
+  myAddress = config.address;
+  mySubnet = config.subnet;
+  Serial.print(F("Set address to..."));
+  Serial.println(myAddress);
+
+  SPI.begin(5, 19, 27, 18);
+  // override the default CS, reset, and IRQ pins (optional)
+  LoRa.setPins(csPin, resetPin, irqPin); // set CS, reset, IRQ pin
+
+  if (!LoRa.begin(BAND))
+  { // initialize ratio at 915 MHz
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true)
+      ; // if failed, do nothing
+  }
+
+  LoRa.onReceive(onReceive);
+  LoRa.receive();
+  Serial.println("LoRa init succeeded.");
+}
+
+void loop()
+{
+  if (millis() - lastSendTime > interval)
+  {
+    String message = "HeLoRa World!"; // send a message
+    sendMessage(message);
+    Serial.println("Sending " + message);
+    lastSendTime = millis();        // timestamp the message
+    interval = random(2000) + 1000; // 2-3 seconds
+    LoRa.receive();                 // go back into receive mode
+  }
+
+  processCommand();
+
+}
+
